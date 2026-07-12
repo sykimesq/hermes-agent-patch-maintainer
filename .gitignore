@@ -1,0 +1,23 @@
+# OS
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+
+# Editor
+.idea/
+.vscode/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Temp
+*.tmp
+*.rej
+*.orig

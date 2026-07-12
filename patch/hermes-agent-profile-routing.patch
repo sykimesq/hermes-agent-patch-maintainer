@@ -1,0 +1,517 @@
+From 63c8fc6ae852d6fcfc510c1e243acbe0f851dfb9 Mon Sep 17 00:00:00 2001
+From: Singyacom <sykimesq@gmail.com>
+Date: Sun, 12 Jul 2026 23:22:51 +0900
+Subject: [PATCH 1/2] patch(hermes-agent-profile-routing): re-apply after
+ upstream update (HEAD 7b5ba2054)
+
+---
+ tools/delegate_tool.py | 202 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 175 insertions(+), 27 deletions(-)
+
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 24c2cd332..e40f7449e 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -2373,6 +2373,8 @@ def delegate_task(
+     max_iterations: Optional[int] = None,
+     role: Optional[str] = None,
+     background: Optional[bool] = None,
++    agent: Optional[str] = None,
++    profile: Optional[str] = None,
+     parent_agent=None,
+ ) -> str:
+     """
+@@ -2387,6 +2389,14 @@ def delegate_task(
+     toolset and can spawn its own workers, bounded by
+     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+ 
++    Optional 'agent' / 'profile' (top-level or per-task) selects an
++    operator-defined routing profile from ``delegation.agent_profiles`` in
++    config.yaml, pinning that child to a configured provider/model. This is
++    the ONLY per-call model-routing knob and it is operator-controlled — the
++    model may name a profile but cannot specify arbitrary provider/model/base
++    URL/api_key. Unknown profile names log a warning and fall back to the
++    base delegation credentials.
++
+     Returns JSON with results array, one entry per task.
+     """
+     if parent_agent is None:
+@@ -2444,15 +2454,14 @@ def delegate_task(
+         )
+     effective_max_iter = default_max_iter
+ 
+-    # Resolve delegation credentials (provider:model pair).
+-    # When delegation.provider is configured, this resolves the full credential
+-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
+-    # used by CLI/gateway startup.  When unconfigured, returns None values so
+-    # children inherit from the parent.
+-    try:
+-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+-    except ValueError as exc:
+-        return tool_error(str(exc))
++    # Resolve delegation credentials PER TASK (provider:model pair).
++    # Each child may be routed to a different provider:model via an
++    # operator-defined profile (delegation.agent_profiles). The base
++    # delegation config (delegation.provider / delegation.model) is the
++    # fallback when no per-task profile is named. When neither is configured,
++    # credentials resolve to None and the child inherits from the parent.
++    # A resolution failure (missing key, bad provider) returns an error for
++    # that child rather than crashing the whole batch.
+ 
+     # Normalize to task list
+     max_children = _get_max_concurrent_children()
+@@ -2473,7 +2482,14 @@ def delegate_task(
+             )
+         task_list = tasks
+     elif goal and isinstance(goal, str) and goal.strip():
+-        task_list = [{"goal": goal, "context": context, "role": top_role}]
++        single_task = {"goal": goal, "context": context, "role": top_role}
++        # Top-level agent/profile applies to the single child (operator
++        # convenience synonym for `tasks=[{..., "agent": ...}]`).
++        if agent:
++            single_task["agent"] = agent
++        if profile:
++            single_task["profile"] = profile
++        task_list = [single_task]
+     else:
+         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+ 
+@@ -2507,11 +2523,27 @@ def delegate_task(
+     # Wrapped in try/finally so the global is always restored even if a
+     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
+     children = []
++    # Resolved effective models, in task order — used for the background
++    # dispatch record's single `model` metadata field (which can only hold one
++    # value; reflects per-task routing when homogeneous, else a joined list).
++    child_models: List[str] = []
+     try:
+         for i, t in enumerate(task_list):
+             # Per-task role beats top-level; normalise again so unknown
+             # per-task values warn and degrade to leaf uniformly.
+             effective_role = _normalize_role(t.get("role") or top_role)
++            # Resolve this child's credentials. Precedence:
++            #   1. task["agent"]/task["profile"] via delegation.agent_profiles
++            #   2. top-level agent/profile (single-task mode)
++            #   3. base delegation.provider/delegation.model
++            #   4. parent inheritance (resolved inside the helper when unset)
++            profile_name = t.get("agent") or t.get("profile") or agent or profile
++            try:
++                task_creds = _resolve_delegation_credentials(
++                    cfg, parent_agent, profile=profile_name
++                )
++            except ValueError as exc:
++                return tool_error(str(exc))
+             child = _build_child_agent(
+                 task_index=i,
+                 goal=t["goal"],
+@@ -2519,23 +2551,24 @@ def delegate_task(
+                 # Subagents always inherit the parent's toolsets; the model
+                 # cannot choose or narrow them (no model-facing toolsets arg).
+                 toolsets=None,
+-                model=creds["model"],
++                model=task_creds["model"],
+                 max_iterations=effective_max_iter,
+                 task_count=n_tasks,
+                 parent_agent=parent_agent,
+-                override_provider=creds["provider"],
+-                override_base_url=creds["base_url"],
+-                override_api_key=creds["api_key"],
+-                override_api_mode=creds["api_mode"],
+-                override_request_overrides=creds.get("request_overrides"),
+-                override_max_tokens=creds.get("max_output_tokens"),
+-                override_acp_command=creds.get("command"),
+-                override_acp_args=creds.get("args"),
++                override_provider=task_creds["provider"],
++                override_base_url=task_creds["base_url"],
++                override_api_key=task_creds["api_key"],
++                override_api_mode=task_creds["api_mode"],
++                override_request_overrides=task_creds.get("request_overrides"),
++                override_max_tokens=task_creds.get("max_output_tokens"),
++                override_acp_command=task_creds.get("command"),
++                override_acp_args=task_creds.get("args"),
+                 role=effective_role,
+             )
+             # Override with correct parent tool names (before child construction mutated global)
+             child._delegate_saved_tool_names = _parent_tool_names
+             children.append((i, t, child))
++            child_models.append(task_creds["model"] or getattr(parent_agent, "model", None) or "")
+     finally:
+         # Authoritative restore: reset global to parent's tool names after all children built
+         _model_tools._last_resolved_tool_names = _parent_tool_names
+@@ -2876,6 +2909,15 @@ def delegate_task(
+                     pass
+ 
+         _goals = [t["goal"] for t in task_list]
++        # `model` here is a single metadata field for the delegation record.
++        # With per-task profile routing each child may use a different model,
++        # so we summarise: one value when homogeneous, else a joined list.
++        _unique_models = [m for m in child_models if m]
++        _model_meta = (
++            _unique_models[0]
++            if len(set(_unique_models)) <= 1
++            else ", ".join(dict.fromkeys(_unique_models))
++        )
+         dispatch = dispatch_async_delegation_batch(
+             goals=_goals,
+             context=context,
+@@ -2883,7 +2925,7 @@ def delegate_task(
+             # parent's toolsets (no model-facing toolsets arg).
+             toolsets=None,
+             role=top_role,
+-            model=creds["model"],
++            model=_model_meta,
+             session_key=_session_key,
+             origin_ui_session_id=_origin_ui_session_id,
+             parent_session_id=_parent_session_id,
+@@ -3024,7 +3066,63 @@ def _resolve_child_credential_pool(
+     return None
+ 
+ 
+-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
++# Routing keys an operator-defined delegation profile may override on the
++# base delegation config. Kept to a strict allow-list so a profile can only
++# steer provider/model/endpoint auth — never unrelated delegation settings.
++_PROFILE_MERGE_KEYS = (
++    "provider",
++    "model",
++    "base_url",
++    "api_key",
++    "api_mode",
++    "command",
++    "args",
++)
++
++
++def _get_profile_config(cfg: dict, profile_name: Optional[str]) -> Optional[dict]:
++    """Look up an operator-defined delegation profile by name.
++
++    Profiles live under ``delegation.agent_profiles`` (preferred) or the
++    legacy ``delegation.agents`` key. Returns the profile dict, or ``None``
++    when the name is missing or is not a dict. Unknown names are NOT an error
++    here — the caller logs a warning and falls back to the base delegation
++    credentials, so a typo never crashes a delegation.
++    """
++    if not profile_name:
++        return None
++    profiles = cfg.get("agent_profiles") or cfg.get("agents") or {}
++    if not isinstance(profiles, dict):
++        return None
++    profile = profiles.get(str(profile_name).strip())
++    if not isinstance(profile, dict):
++        logger.warning(
++            "Unknown delegation agent profile %r; using default delegation "
++            "credentials for this subagent.",
++            profile_name,
++        )
++        return None
++    return profile
++
++
++def _merge_delegation_profile(cfg: dict, profile: dict) -> dict:
++    """Merge a named profile's routing keys over the base delegation config.
++
++    Only operator-controlled routing keys (``_PROFILE_MERGE_KEYS``) are
++    merged; a profile cleanly overrides provider/model/endpoint for the child
++    without touching the rest of the base config. The merged copy is what
++    credential resolution runs against.
++    """
++    merged = dict(cfg)
++    for key in _PROFILE_MERGE_KEYS:
++        if key in profile:
++            merged[key] = profile[key]
++    return merged
++
++
++def _resolve_delegation_credentials(
++    cfg: dict, parent_agent, profile: Optional[str] = None
++) -> dict:
+     """Resolve credentials for subagent delegation.
+ 
+     If ``delegation.base_url`` is configured, subagents use that direct
+@@ -3043,13 +3141,27 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+     If neither base_url nor provider is configured, returns None values so the
+     child inherits everything from the parent agent.
+ 
++    When ``profile`` names an entry in ``delegation.agent_profiles`` (or the
++    legacy ``delegation.agents``), that profile's operator-defined
++    provider/model (and optional base_url/api_key/api_mode/command/args)
++    override the base delegation config for THIS child only. An unknown
++    profile name logs a warning and falls back to the base delegation
++    credentials rather than crashing — model routing stays operator-controlled.
++
+     Raises ValueError with a user-friendly message on credential failure.
+     """
+-    configured_model = str(cfg.get("model") or "").strip() or None
+-    configured_provider = str(cfg.get("provider") or "").strip() or None
+-    configured_base_url = str(cfg.get("base_url") or "").strip() or None
+-    configured_api_key = str(cfg.get("api_key") or "").strip() or None
+-    configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
++    # Apply a named routing profile (if any) before resolving credentials.
++    effective_cfg = cfg
++    if profile:
++        prof = _get_profile_config(cfg, profile)
++        if prof is not None:
++            effective_cfg = _merge_delegation_profile(cfg, prof)
++
++    configured_model = str(effective_cfg.get("model") or "").strip() or None
++    configured_provider = str(effective_cfg.get("provider") or "").strip() or None
++    configured_base_url = str(effective_cfg.get("base_url") or "").strip() or None
++    configured_api_key = str(effective_cfg.get("api_key") or "").strip() or None
++    configured_api_mode = str(effective_cfg.get("api_mode") or "").strip().lower() or None
+ 
+     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
+     # wire protocol — they cannot be reached via OpenAI chat_completions against
+@@ -3293,7 +3405,7 @@ def _build_top_level_description() -> str:
+         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
+         f"user and can be disabled globally via "
+         "delegation.orchestrator_enabled=false.\n"
+-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
++        "- Subagent model/provider is operator-controlled. By default, children inherit the parent model or the global delegation.provider/delegation.model config. If delegation.agent_profiles is configured, tasks may specify an agent/profile name to select a configured routing profile.\n"
+         "- Each subagent gets its own terminal session (separate working directory and state).\n"
+         "- Results are always returned as an array, one entry per task."
+     )
+@@ -3422,6 +3534,23 @@ DELEGATE_TASK_SCHEMA = {
+                             "enum": ["leaf", "orchestrator"],
+                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                         },
++                        "agent": {
++                            "type": "string",
++                            "description": (
++                                "Optional operator-defined delegation profile "
++                                "name from config.yaml (delegation.agent_profiles), "
++                                "e.g. 'mira', 'rumi', 'zoe'. Routes this child to the "
++                                "configured provider/model. The model may only name a "
++                                "profile; it cannot specify arbitrary provider/model."
++                            ),
++                        },
++                        "profile": {
++                            "type": "string",
++                            "description": (
++                                "Alias for 'agent'. Optional operator-defined "
++                                "delegation profile name from config.yaml."
++                            ),
++                        },
+                     },
+                     "required": ["goal"],
+                 },
+@@ -3435,6 +3564,23 @@ DELEGATE_TASK_SCHEMA = {
+                 "enum": ["leaf", "orchestrator"],
+                 "description": "(rebuilt at get_definitions() time)",
+             },
++            "agent": {
++                "type": "string",
++                "description": (
++                    "Optional operator-defined delegation profile name from "
++                    "config.yaml (delegation.agent_profiles). Applies to a "
++                    "single-task delegation. Per-task 'agent' on items in "
++                    "'tasks' overrides this. The model may only name a "
++                    "profile; it cannot specify arbitrary provider/model."
++                ),
++            },
++            "profile": {
++                "type": "string",
++                "description": (
++                    "Alias for 'agent'. Optional operator-defined delegation "
++                    "profile name from config.yaml (applies to single-task mode)."
++                ),
++            },
+             "background": {
+                 "type": "boolean",
+                 "description": (
+@@ -3505,6 +3651,8 @@ registry.register(
+         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+         max_iterations=args.get("max_iterations"),
+         role=args.get("role"),
++        agent=args.get("agent"),
++        profile=args.get("profile"),
+         background=_model_background_value(args, kw.get("parent_agent")),
+         parent_agent=kw.get("parent_agent"),
+     ),
+-- 
+2.54.0.windows.1
+
+
+From 0ea98d36a5ea5c5df6a52b67460c266f3c586333 Mon Sep 17 00:00:00 2001
+From: Singyacom <sykimesq@gmail.com>
+Date: Sun, 12 Jul 2026 23:22:51 +0900
+Subject: [PATCH 2/2] test(delegate): re-apply TestAgentProfileRouting +
+ TestDelegateSchemaProfileFields
+
+---
+ tests/tools/test_delegate.py | 152 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 152 insertions(+)
+
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index 0fe6e0028..b6c974c77 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -22,8 +22,12 @@ from tools.delegate_tool import (
+     DELEGATE_TASK_SCHEMA,
+     DelegateEvent,
+     _get_max_concurrent_children,
++    _get_profile_config,
+     _load_config,
+     _LEGACY_EVENT_MAP,
++    _merge_delegation_profile,
++    _PROFILE_MERGE_KEYS,
++    _resolve_delegation_credentials,
+     MAX_DEPTH,
+     check_delegate_requirements,
+     delegate_task,
+@@ -3155,5 +3159,153 @@ class TestFallbackModelInheritance(unittest.TestCase):
+         self.assertIsNone(kwargs["fallback_model"])
+ 
+ 
++class TestAgentProfileRouting(unittest.TestCase):
++    """Per-task model routing via delegation.agent_profiles.
++
++    Each subagent in a delegate_task batch may be routed to a different
++    provider/model by naming an entry under delegation.agent_profiles. The
++    profile is operator-controlled (not model-facing) — the model can only
++    NAME a profile, never specify provider/model/base_url/api_key directly.
++    """
++
++    def test_get_profile_config_basic_lookup(self):
++        cfg = {"agent_profiles": {
++            "mira": {"provider": "openrouter", "model": "m1"},
++            "rumi": {"provider": "openrouter", "model": "m2"},
++        }}
++        self.assertEqual(_get_profile_config(cfg, "mira"),
++                         {"provider": "openrouter", "model": "m1"})
++        self.assertEqual(_get_profile_config(cfg, "rumi")["model"], "m2")
++
++    def test_get_profile_config_legacy_agents_key(self):
++        cfg = {"agents": {"legacy": {"provider": "p", "model": "m"}}}
++        self.assertEqual(_get_profile_config(cfg, "legacy"),
++                         {"provider": "p", "model": "m"})
++
++    def test_get_profile_config_unknown_returns_none_and_logs(self):
++        cfg = {"agent_profiles": {"mira": {"provider": "p", "model": "m"}}}
++        with self.assertLogs("tools.delegate_tool", level="WARNING") as cm:
++            self.assertIsNone(_get_profile_config(cfg, "nope"))
++        self.assertTrue(any("nope" in m for m in cm.output),
++                        f"warning must mention the unknown profile name; got {cm.output}")
++
++    def test_get_profile_config_empty_name_returns_none(self):
++        cfg = {"agent_profiles": {"mira": {"provider": "p", "model": "m"}}}
++        self.assertIsNone(_get_profile_config(cfg, ""))
++        self.assertIsNone(_get_profile_config(cfg, None))
++
++    def test_merge_profile_allowlist_strict(self):
++        base = {"provider": "bp", "model": "bm", "max_concurrent_children": 5}
++        profile = {"provider": "pp", "model": "pm", "base_url": "http://x",
++                   "unknown_key": "should_not_appear"}
++        merged = _merge_delegation_profile(base, profile)
++        self.assertEqual(merged["provider"], "pp")
++        self.assertEqual(merged["model"], "pm")
++        self.assertEqual(merged["base_url"], "http://x")
++        self.assertEqual(merged["max_concurrent_children"], 5)
++        self.assertNotIn("unknown_key", merged)
++
++    def test_profile_merge_keys_exact_set(self):
++        # Strict 7-key allow-list. Adding/removing a key here is a deliberate
++        # contract change — keep this test in sync with _PROFILE_MERGE_KEYS.
++        self.assertEqual(
++            set(_PROFILE_MERGE_KEYS),
++            {"provider", "model", "base_url", "api_key", "api_mode",
++             "command", "args"},
++        )
++
++    def test_resolve_credentials_per_profile_yields_different_models(self):
++        """Same _resolve_delegation_credentials call, different profile name
++        => different provider/model. This is the core anti-inheritance test:
++        the parent model must NOT bleed through when a profile names a
++        different provider/model."""
++        # base_url is set so the resolver bypasses resolve_runtime_provider(),
++        # which would otherwise refuse unknown providers in test environments.
++        cfg = {"agent_profiles": {
++            "mira": {"provider": "openrouter",
++                     "model": "mira-m",
++                     "base_url": "https://mira.example.com/v1"},
++            "rumi": {"provider": "openrouter",
++                     "model": "rumi-m",
++                     "base_url": "https://rumi.example.com/v1"},
++        }}
++        parent = _make_mock_parent()
++        mira = _resolve_delegation_credentials(cfg, parent, profile="mira")
++        rumi = _resolve_delegation_credentials(cfg, parent, profile="rumi")
++        self.assertEqual(mira["base_url"], "https://mira.example.com/v1")
++        self.assertEqual(mira["model"], "mira-m")
++        self.assertEqual(rumi["base_url"], "https://rumi.example.com/v1")
++        self.assertEqual(rumi["model"], "rumi-m")
++        self.assertNotEqual(mira["model"], rumi["model"],
++                            "Per-profile routing must produce different models")
++
++    def test_resolve_credentials_no_profile_uses_base(self):
++        cfg = {"provider": "openrouter", "model": "base-m",
++               "base_url": "https://base.example.com/v1",
++               "agent_profiles": {"mira": {"provider": "openrouter",
++                                           "model": "x",
++                                           "base_url": "https://x.example.com/v1"}}}
++        parent = _make_mock_parent()
++        creds = _resolve_delegation_credentials(cfg, parent, profile=None)
++        self.assertEqual(creds["model"], "base-m")
++        self.assertEqual(creds["base_url"], "https://base.example.com/v1")
++
++    def test_resolve_credentials_unknown_profile_falls_back_to_base(self):
++        cfg = {"provider": "openrouter", "model": "base-m",
++               "base_url": "https://base.example.com/v1",
++               "agent_profiles": {"mira": {"provider": "openrouter",
++                                           "model": "x",
++                                           "base_url": "https://x.example.com/v1"}}}
++        parent = _make_mock_parent()
++        with self.assertLogs("tools.delegate_tool", level="WARNING") as cm:
++            creds = _resolve_delegation_credentials(cfg, parent, profile="typo")
++        self.assertEqual(creds["model"], "base-m")
++        self.assertEqual(creds["base_url"], "https://base.example.com/v1")
++        self.assertTrue(any("typo" in m for m in cm.output))
++
++    def test_resolve_credentials_empty_config_returns_none_for_parent_inheritance(self):
++        """When neither profile nor base provider is configured, every field
++        is None — the child must inherit everything from the parent agent."""
++        parent = _make_mock_parent()
++        creds = _resolve_delegation_credentials({}, parent, profile=None)
++        for key in ("provider", "model", "base_url", "api_key", "api_mode"):
++            self.assertIsNone(creds[key],
++                              f"{key} must be None for parent inheritance")
++
++
++class TestDelegateSchemaProfileFields(unittest.TestCase):
++    """DELEGATE_TASK_SCHEMA exposes agent/profile only — never provider/model/base_url/api_key/api_mode.
++
++    The model may NAME a profile but may not specify arbitrary provider/model.
++    This is the security boundary enforced by the schema. A leak here means
++    the model can bypass operator-controlled routing.
++    """
++
++    def test_schema_top_level_has_agent_and_profile(self):
++        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
++        self.assertIn("agent", props)
++        self.assertIn("profile", props)
++        self.assertEqual(props["agent"]["type"], "string")
++        self.assertEqual(props["profile"]["type"], "string")
++
++    def test_schema_per_task_items_have_agent_and_profile(self):
++        items = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]
++        items_props = items["properties"]
++        self.assertIn("agent", items_props)
++        self.assertIn("profile", items_props)
++
++    def test_schema_no_provider_model_or_credentials_in_per_task_items(self):
++        """per-task items MUST NOT expose provider/model/base_url/api_key/api_mode.
++        These are operator-controlled config, not model-facing knobs."""
++        items_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
++        for forbidden in ("provider", "model", "base_url", "api_key", "api_mode"):
++            self.assertNotIn(
++                forbidden, items_props,
++                f"per-task schema must not expose {forbidden!r} — "
++                f"it would let the model bypass operator-controlled routing. "
++                f"Got keys: {sorted(items_props.keys())}",
++            )
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.54.0.windows.1
+

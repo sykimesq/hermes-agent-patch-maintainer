@@ -1,0 +1,49 @@
+# =============================================================================
+# agent_profiles.yaml — Hermes Agent Profile Routing 설정 참조
+# =============================================================================
+#
+# 이 파일은 ~/.hermes/profiles/sydney/config.yaml의
+# delegation.agent_profiles 섹션을 참조용으로 보관한 것입니다.
+#
+# 실제 설정은 config.yaml에 있으며, 이 파일은 다음 용도로 사용됩니다:
+#   - 패치 재구현 시 참조
+#   - 프로필 구조 문서화
+#   - 새 프로필 추가 시 템플릿
+# =============================================================================
+
+# --- config.yaml의 delegation 섹션 (참조용) ---
+# 아래 설정은 C:/Users/SYKIM/AppData/Local/hermes/profiles/sydney/config.yaml에 있습니다.
+
+delegation:
+  # 기본 delegation 설정 (프로필 미지정 시 사용)
+  model: ""
+  provider: ""
+
+  # agent_profiles: 각 subagent에 할당할 provider/model 쌍
+  agent_profiles:
+    # mira: Planning 전용
+    mira:
+      provider: minimax-oauth
+      model: MiniMax-M3
+
+    # rumi: Implementation 전용
+    rumi:
+      provider: openrouter
+      model: poolside/laguna-xs-2.1:free
+
+    # zoe: Verification 전용
+    zoe:
+      provider: openrouter
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
+
+# --- 프로필 추가 템플릿 ---
+# 새 프로필을 추가하려면 아래 형식을 따르세요:
+#
+#   <profile_name>:
+#     provider: <provider_name>    # 필수
+#     model: <model_name>          # 필수
+#     base_url: <url>              # 선택
+#     api_key: <key>               # 선택
+#     api_mode: <mode>             # 선택
+#     command: <command>           # 선택 (ACP transport)
+#     args: [<arg>, ...]           # 선택 (ACP transport args)
