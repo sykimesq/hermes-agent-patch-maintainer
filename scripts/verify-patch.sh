@@ -25,6 +25,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# Windows pytest temp 디렉토리 권한 문제 회피
+# PermissionError: [WinError 5] 액세스가 거부되었습니다: 'C:\\Users\\SYKIM\\AppData\\Local\\Temp\\pytest-of-SYKIM'
+# --basetemp을 지정하면 깨끗한 임시 디렉토리에서 테스트 실행
+PYTEST_BASETEMP="C:/Users/SYKIM/AppData/Local/Temp/hermes-pytest"
+PYTEST_OPTS="--basetemp $PYTEST_BASETEMP"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -180,7 +186,7 @@ if [ -f "tests/tools/test_delegate.py" ]; then
         echo ""
         echo -e "    ${CYAN}테스트 실행 중...${NC}"
         set +e
-        TEST_OUTPUT=$(python -m pytest tests/tools/test_delegate.py::TestAgentProfileRouting -v --tb=short 2>&1)
+        TEST_OUTPUT=$(python -m pytest tests/tools/test_delegate.py::TestAgentProfileRouting -v --tb=short $PYTEST_OPTS 2>&1)
         TEST_EXIT=$?
         set -euo pipefail
 
@@ -199,7 +205,7 @@ if [ -f "tests/tools/test_delegate.py" ]; then
         # TestDelegateSchemaProfileFields 테스트
         if grep -q "class TestDelegateSchemaProfileFields" tests/tools/test_delegate.py; then
             set +e
-            SCHEMA_OUTPUT=$(python -m pytest tests/tools/test_delegate.py::TestDelegateSchemaProfileFields -v --tb=short 2>&1)
+            SCHEMA_OUTPUT=$(python -m pytest tests/tools/test_delegate.py::TestDelegateSchemaProfileFields -v --tb=short $PYTEST_OPTS 2>&1)
             SCHEMA_EXIT=$?
             set -euo pipefail
 
@@ -222,7 +228,7 @@ if [ -f "tests/tools/test_delegate.py" ]; then
     echo ""
     echo -e "    ${CYAN}기존 테스트 회귀 검증 중...${NC}"
     set +e
-    REGRESS_OUTPUT=$(python -m pytest tests/tools/test_delegate.py -v --tb=short -k "not TestAgentProfileRouting and not TestDelegateSchemaProfileFields" 2>&1)
+    REGRESS_OUTPUT=$(python -m pytest tests/tools/test_delegate.py -v --tb=short -k "not TestAgentProfileRouting and not TestDelegateSchemaProfileFields" $PYTEST_OPTS 2>&1)
     REGRESS_EXIT=$?
     set -euo pipefail
 
