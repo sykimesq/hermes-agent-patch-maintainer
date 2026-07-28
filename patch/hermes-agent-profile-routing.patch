@@ -1,25 +1,21 @@
-From beb08ac746cf6b524217e07aa0fcef638306ca0f Mon Sep 17 00:00:00 2001
+From cd3f89b8d06056333c626f8130c63076c7cfac5b Mon Sep 17 00:00:00 2001
 From: S Y Kim <sykimesq@gmail.com>
-Date: Fri, 24 Jul 2026 14:12:51 +0900
+Date: Tue, 28 Jul 2026 17:41:16 +0900
 Subject: [PATCH] feat(delegation): support agent profile model routing
+ (re-apply after upstream update)
 
-Add per-task model routing via delegation.agent_profiles in config.yaml.
-Each subagent in a batch can use a different provider/model by naming
-a profile from config.yaml via the 'agent' or 'profile' parameter.
-
-- _PROFILE_MERGE_KEYS: strict allow-list of 7 routing keys
-- _get_profile_config(): lookup profile by name (safe fallback)
-- _merge_delegation_profile(): merge profile keys into base creds
-- delegate_task() gains agent/profile params; per-task resolution
-- DELEGATE_TASK_SCHEMA exposes agent/profile (not provider/model)
-- 15 new tests: TestAgentProfileRouting + TestDelegateSchemaProfileFields
+Re-apply the agent profile routing patch after upstream changes.
+- _PROFILE_MERGE_KEYS, _get_profile_config(), _merge_delegation_profile()
+- delegate_task() agent/profile params + per-task credential resolution
+- DELEGATE_TASK_SCHEMA agent/profile fields (not provider/model)
+- 15 tests: TestAgentProfileRouting + TestDelegateSchemaProfileFields
 ---
  tests/tools/test_delegate.py | 176 +++++++++++++++++++++++++++++++++++
  tools/delegate_tool.py       | 102 +++++++++++++++++++-
  2 files changed, 273 insertions(+), 5 deletions(-)
 
 diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
-index e17a0c77e..53c38946b 100644
+index 7c0b76304..0c10724d3 100644
 --- a/tests/tools/test_delegate.py
 +++ b/tests/tools/test_delegate.py
 @@ -22,8 +22,10 @@ from tools.delegate_tool import (
@@ -33,7 +29,7 @@ index e17a0c77e..53c38946b 100644
      MAX_DEPTH,
      check_delegate_requirements,
      delegate_task,
-@@ -3257,5 +3259,179 @@ class TestFallbackModelInheritance(unittest.TestCase):
+@@ -3311,5 +3313,179 @@ class TestFallbackModelInheritance(unittest.TestCase):
          self.assertIsNone(kwargs["fallback_model"])
  
  
@@ -214,10 +210,10 @@ index e17a0c77e..53c38946b 100644
  if __name__ == "__main__":
      unittest.main()
 diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index 761785d7a..bf38ad6f4 100644
+index 7894a6af9..8f4c63939 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
-@@ -2437,19 +2437,27 @@ def delegate_task(
+@@ -2762,19 +2762,27 @@ def delegate_task(
      role: Optional[str] = None,
      background: Optional[bool] = None,
      parent_agent=None,
@@ -246,7 +242,7 @@ index 761785d7a..bf38ad6f4 100644
      Returns JSON with results array, one entry per task.
      """
      if parent_agent is None:
-@@ -2509,16 +2517,19 @@ def delegate_task(
+@@ -2834,16 +2842,19 @@ def delegate_task(
          )
      effective_max_iter = default_max_iter
  
@@ -268,32 +264,32 @@ index 761785d7a..bf38ad6f4 100644
      # Normalize to task list
      max_children = _get_max_concurrent_children()
      recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
-@@ -2604,6 +2615,24 @@ def delegate_task(
-             # Per-task role beats top-level; normalise again so unknown
-             # per-task values warn and degrade to leaf uniformly.
-             effective_role = _normalize_role(t.get("role") or top_role)
+@@ -2923,6 +2934,24 @@ def delegate_task(
+         # Per-task role beats top-level; normalise again so unknown
+         # per-task values warn and degrade to leaf uniformly.
+         effective_role = _normalize_role(t.get("role") or top_role)
 +
-+            # Per-task agent/profile beats top-level; resolve credentials
-+            # with profile merge for this task.
-+            task_agent = t.get("agent") or t.get("profile") or top_agent
-+            if task_agent:
-+                profile_cfg = _get_profile_config(cfg, task_agent)
-+                if profile_cfg is not None:
-+                    creds = _merge_delegation_profile(base_creds, profile_cfg)
-+                else:
-+                    logger.warning(
-+                        "delegate_task: unknown agent profile %r — "
-+                        "falling back to base delegation credentials",
-+                        task_agent,
-+                    )
-+                    creds = base_creds
++        # Per-task agent/profile beats top-level; resolve credentials
++        # with profile merge for this task.
++        task_agent = t.get("agent") or t.get("profile") or top_agent
++        if task_agent:
++            profile_cfg = _get_profile_config(cfg, task_agent)
++            if profile_cfg is not None:
++                creds = _merge_delegation_profile(base_creds, profile_cfg)
 +            else:
++                logger.warning(
++                    "delegate_task: unknown agent profile %r — "
++                    "falling back to base delegation credentials",
++                    task_agent,
++                )
 +                creds = base_creds
++        else:
++            creds = base_creds
 +
-             child = _build_child_agent(
-                 task_index=i,
-                 goal=t["goal"],
-@@ -3046,7 +3075,7 @@ def delegate_task(
+         child = _build_child_preserving_parent_tools(
+             task_index=i,
+             goal=t["goal"],
+@@ -3298,7 +3327,7 @@ def delegate_task(
              # parent's toolsets (no model-facing toolsets arg).
              toolsets=None,
              role=top_role,
@@ -302,7 +298,7 @@ index 761785d7a..bf38ad6f4 100644
              session_key=_session_key,
              origin_ui_session_id=_origin_ui_session_id,
              origin_session_id=_wake_sid,
-@@ -3327,6 +3356,43 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+@@ -3580,6 +3609,43 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
      }
  
  
@@ -346,7 +342,7 @@ index 761785d7a..bf38ad6f4 100644
  def _load_config() -> dict:
      """Load delegation config from the active Hermes config.
  
-@@ -3475,7 +3541,7 @@ def _build_top_level_description() -> str:
+@@ -3728,7 +3794,7 @@ def _build_top_level_description() -> str:
          f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
          f"user and can be disabled globally via "
          "delegation.orchestrator_enabled=false.\n"
@@ -355,7 +351,7 @@ index 761785d7a..bf38ad6f4 100644
          "- Each subagent gets its own terminal session (separate working directory and state).\n"
          "- Results are always returned as an array, one entry per task."
      )
-@@ -3604,6 +3670,14 @@ DELEGATE_TASK_SCHEMA = {
+@@ -3857,6 +3923,14 @@ DELEGATE_TASK_SCHEMA = {
                              "enum": ["leaf", "orchestrator"],
                              "description": "Per-task role override. See top-level 'role' for semantics.",
                          },
@@ -370,7 +366,7 @@ index 761785d7a..bf38ad6f4 100644
                      },
                      "required": ["goal"],
                  },
-@@ -3629,6 +3703,22 @@ DELEGATE_TASK_SCHEMA = {
+@@ -3882,6 +3956,22 @@ DELEGATE_TASK_SCHEMA = {
                      "backward compatibility."
                  ),
              },
@@ -393,7 +389,7 @@ index 761785d7a..bf38ad6f4 100644
          },
          "required": [],
      },
-@@ -3690,6 +3780,8 @@ registry.register(
+@@ -3943,6 +4033,8 @@ registry.register(
          role=args.get("role"),
          background=_model_background_value(args, kw.get("parent_agent")),
          parent_agent=kw.get("parent_agent"),
